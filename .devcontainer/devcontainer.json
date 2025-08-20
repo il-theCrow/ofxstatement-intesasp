@@ -7,7 +7,8 @@
 	"features": {
 		"ghcr.io/devcontainers-extra/features/poetry": {
 			"version": "2.1.4",
-		}
+		},
+		"ghcr.io/devcontainers/features/git-lfs": {},
 	}
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
