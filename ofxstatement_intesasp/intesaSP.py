@@ -9,9 +9,8 @@ from decimal import Decimal
 
 from ofxstatement.parser import StatementParser
 from ofxstatement.plugin import Plugin
-from ofxstatement.statement import (Statement, StatementLine,
-                                    generate_transaction_id)
-from openpyxl import load_workbook
+from ofxstatement.statement import Statement, StatementLine, BankAccount, generate_transaction_id
+from openpyxl import load_workbook, Workbook
 from openpyxl.utils import column_index_from_string
 
 logging.basicConfig(level=logging.DEBUG)
@@ -45,15 +44,15 @@ class Movimento_V1(Movimento):
 
     def __post_init__(self):
         # Modificare descrizione_estesa per comprendere sempre la descrizione
-        self.descrizione_estesa = f"({self.descrizione}) " \
-                                  f"{self.descrizione_estesa}"
+        self.descrizione_estesa = f"({self.descrizione}) {self.descrizione_estesa}"
 
         # Una volta raccolti i dati, li formatto nello standard corretto
         self.stat_line = StatementLine(
             None,
             self.data_contabile,
             self.descrizione_estesa,
-            Decimal(self.accrediti) if self.accrediti else Decimal(self.addebiti)
+            Decimal(self.accrediti) if self.accrediti else Decimal(
+                self.addebiti)
         )
         self.stat_line.id = generate_transaction_id(self.stat_line)
         self.stat_line.date_user = self.data_valuta
@@ -134,19 +133,27 @@ class Movimento_V2(Movimento):
 
     def __post_init__(self):
         # Modificare descrizione_estesa per comprendere sempre la categoria
-        descrizione_estesa = f"[({self.categoria})-({self.operazione})] " \
-                             f"{self.dettagli}"
+        memo = f"[{self.categoria}] {self.operazione} - {self.dettagli}"
 
         # Una volta raccolti i dati, li formatto nello standard corretto
         # NB: Questo formato non prevede la differenziazione tra la data
         #     contabile e quella di valuta, tutte le transazione useranno la
         #     data di valuta come riferimento
         self.stat_line = StatementLine(
-            None, self.data, descrizione_estesa, Decimal(self.importo)
+            None, self.data, memo, Decimal(self.importo)
         )
         self.stat_line.id = generate_transaction_id(self.stat_line)
         self.stat_line.date_user = self.data
         self.stat_line.trntype = self._get_transaction_type()
+        self.stat_line.payee = self._get_payee()
+
+    def _get_payee(self) -> str:
+        match self:
+            case Movimento_V2(operazione=operazione, dettagli=dettagli) \
+                    if operazione == "Pagamento Pos":
+                return dettagli
+            case _:
+                return self.operazione
 
     def _get_transaction_type(self):
         # OFX Spec https://financialdataexchange.org/ofx
@@ -171,14 +178,14 @@ class Movimento_V2(Movimento):
             'disposizione di bonifico': 'PAYMENT',
             'domiciliazioni e utenze': 'REPEATPMT',
             'donazioni': 'DIRECTDEBIT',
-            'famiglie varie' : 'POS',
+            'famiglie varie': 'POS',
             'farmacia': 'POS',
             'generi alimentari e supermercato': 'POS',
             'gas & energia elettrica': 'DIRECTDEBIT',
             'hi-tech e informatica': 'POS',
             'elettrodomestici, arredamento e giardino': 'POS',
             'libri, film e musica': 'POS',
-            'manutenzione casa' : 'POS',
+            'manutenzione casa': 'POS',
             'manutenzione veicoli': 'POS',
             'imposte sul reddito e tasse varie': 'FEE',
             'tasse varie': 'FEE',
@@ -192,16 +199,19 @@ class Movimento_V2(Movimento):
             'rimborsi spese e storni': 'CREDIT',
             'rimborsi spese mediche': 'CREDIT',
             'ristoranti e bar': 'POS',
-            'spese condominiali' : 'REPEATPMT',
+            'spese condominiali': 'REPEATPMT',
             'spese mediche': 'POS',
             'spettacoli e musei': 'POS',
             'spese importanti e ristrutturazione': 'XFER',
             'stipendi e pensioni': 'DIRECTDEP',
-            'treno, aereo, nave' : 'POS',
+            'treno, aereo, nave': 'POS',
             'tv, internet, telefono': 'POS',
             'tabaccai e simili': 'POS',
             'tempo libero varie': 'POS',
-            'viaggi e vacanze': 'POS'
+            'viaggi e vacanze': 'POS',
+            'pagamento affitti': 'POS',
+            'investimenti, bdr e salvadanaio': 'XFER',
+            'addebito mia carta di credito': 'XFER',
         }
 
         try:
@@ -216,6 +226,11 @@ class Movimento_V2(Movimento):
             )
         return cur_transaction
 
+    def handle_piggy(self, salvadanaio: BankAccount = None):
+        if salvadanaio is not None and self.categoria.lower().strip() == 'investimenti, bdr e salvadanaio':
+            self.stat_line.bank_account_to = salvadanaio
+            self.stat_line.trntype = "XFER"
+
 
 class IntesaSanPaoloPlugin(Plugin):
 
@@ -226,9 +241,10 @@ class IntesaSanPaoloPlugin(Plugin):
 
 class IntesaSanPaoloXlsxParser(StatementParser):
     excel_version: int = None
-    wb = None
+    wb: Workbook = None
     settings = None
     tableStart: int = None
+    salvadanaio: BankAccount = None
 
     def __init__(self, filename, settings):
         self.file = filename
@@ -261,6 +277,13 @@ class IntesaSanPaoloXlsxParser(StatementParser):
         self.statement.start_date = self._get_start_date()
         self.statement.end_balance = self._get_end_balance()
         self.statement.end_date = self._get_end_date()
+
+        if "salvadanaio" in settings:
+            self.salvadanaio = BankAccount(
+                bank_id=settings.get('abi'),
+                acct_id=settings.get("salvadanaio"),
+                acct_type="SAVINGS",
+            )
         logging.debug(self.statement)
 
     """
@@ -298,6 +321,11 @@ class IntesaSanPaoloXlsxParser(StatementParser):
             return self.wb['Lista Operazione']['C7'].value.split(" ")[1].replace('/', '')
 
     def _get_currency(self) -> str:
+
+        # short circuit if currency is specified in settings
+        if "currency" in self.settings:
+            return self.settings["currency"]
+
         # !!! Write All key value lower case !!!
         trans_map = {'euro': 'EUR',
                      'eur': 'EUR'}
@@ -308,10 +336,10 @@ class IntesaSanPaoloXlsxParser(StatementParser):
             # Takes the currency from the first operation
             # this should be safe because there is always atleast 1 operation
             # since you can't export empty files
-            index = 20  # Find first cell under Title
+            index = self.tableStart + 1  # Find first cell under Title
             while True:
                 val = self.wb['Lista Operazione'][f"G{index}"].value
-                if val == "Valuta":
+                if val == "" or val == "Valuta":
                     index += 1
                 else:
                     break
@@ -402,14 +430,18 @@ class IntesaSanPaoloXlsxParser(StatementParser):
         ending_column = column_index_from_string('H')
         starting_row = self.tableStart
 
-        for row in self.wb['Lista Operazione']. \
-                iter_rows(starting_row, None, starting_column, ending_column, values_only=True):
+        for row in (
+            self.wb['Lista Operazione']
+                .iter_rows(starting_row, None, starting_column, ending_column, values_only=True)
+        ):
             if row[0]:
                 # save only accounted transactions
                 if row[4] == "NON CONTABILIZZATO":
                     continue
                 else:
                     logging.debug(row)
-                    yield Movimento_V2(*row)
+                    mov = Movimento_V2(*row)
+                    mov.handle_piggy(self.salvadanaio)
+                    yield mov
             else:
                 break
